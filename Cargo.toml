@@ -10,7 +10,10 @@ edition = "2018"
 mqtt-codec = "0.3.0"
 tokio-util = {version = "0.2.0", features = ["codec"]}
 futures = "0.3.4"
+sequence_trie = "*"
+bytes = "0.5.2"
+bytestring = "0.1.4"
 
 [dependencies.tokio]
 version = "0.2.11"
-features = ['macros', 'tcp', 'rt-core', 'io-util', 'stream']
+features = ['macros', 'tcp', 'rt-core', 'io-util', 'stream', 'sync', 'time']
