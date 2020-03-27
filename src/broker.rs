@@ -12,7 +12,7 @@ use tokio::net::{TcpListener};
 //use tokio::time;
 //use tokio::time::{Duration};
 
-use mqtt_codec::{Packet, SubscribeReturnCode, Packet::*};
+use mqtt_codec::{Packet, SubscribeReturnCode, QoS, Packet::*};
 
 
 
@@ -33,7 +33,7 @@ pub enum BrokerMessage {
 #[derive(Debug)]
 struct Topic {
     name: String,
-    subscribers: Vec<String>,
+    subscribers: Vec<(String, QoS)>,
 }
 
 struct BrokerState {
@@ -116,7 +116,6 @@ impl Broker {
                     let (client, tx) = state.clients.get_mut(&id).unwrap();
                     println!("{:#?}", packet);
                     match packet {
-                        // TODO: remove topics
                         Disconnect => {
                             for topic_str in &client.topics {
                                 let topic = topic_str.split('/');
@@ -125,31 +124,48 @@ impl Broker {
                             state.clients.remove(&id);
                             println!("{:#?}", state.clients);
                         },
-                        // TODO: handle wildcards
+                        // TODO: handle wildcards and store QoS for the client
                         Subscribe{packet_id, topic_filters} => {
                             let mut qos_response: Vec<SubscribeReturnCode> = Vec::new();
                             for (topic, qos) in topic_filters {
                                 let path_str = topic.to_string();
                                 client.topics.push(path_str.clone());
                                 let path = path_str.split('/');
+                                println!("{:?}", path.clone().collect::<Vec<_>>());
                                 match state.topics.get_mut(path.clone())  {
                                     Some(topic) => {
-                                        // add the client to the existing subscribers
+                                        // add the client to the existing subscribers, if they aren't already
                                         println!("topic already exists");
-                                        topic.subscribers.push(id.clone());
+                                        if !client.topics.contains(&topic.name) {
+                                            topic.subscribers.push((id.clone(), qos));
+                                        }
                                     },
                                     None => {
                                         let mut topic = Topic::new(topic.to_string());
-                                        topic.subscribers.push(id.clone());
+                                        topic.subscribers.push((id.clone(), qos));
                                         state.topics.insert(path.clone(), topic);
                                     }
                                 };
+                                println!("{:#?}", state.topics.get_prefix_nodes(path.clone()));
                                 qos_response.push(SubscribeReturnCode::Success(qos));
                             }
                             tx.send(SubscribeAck{packet_id, status: qos_response}).await;
                         },
                         Publish(pub_packet) => {
+                            // TODO: handle dups/wildcards
                             Broker::send_publish(&mut state, pub_packet.payload, pub_packet.topic, pub_packet.packet_id).await;
+                        },
+                        PublishAck{..} => {
+                            // TODO: remove from map
+                        },
+                        PublishReceived {packet_id} => {
+                            tx.send(PublishRelease {packet_id}).await;
+                        },
+                        PublishRelease {packet_id} => {
+                            tx.send(PublishReceived {packet_id}).await;
+                        },
+                        PublishComplete {..} => {
+                            // TODO: remove from map
                         },
                         _ => {
 
@@ -165,21 +181,51 @@ impl Broker {
         let path_str = topic.clone().to_string();
         let path = path_str.split('/');
         //println!("{:#?}", path);
-        let clients_to_send = &state.topics.get(path.clone()).unwrap().subscribers;
+        let clients_to_send = &match state.topics.get(path.clone()) {
+            Some(val) => val,
+            None => {
+                let topic = Topic::new(topic.to_string());
+                state.topics.insert(path.clone(), topic);
+                &state.topics.get(path.clone()).unwrap()
+            }
+        }.subscribers;
+
+        /*let clients_to_send = state.topics.get(path.clone()).unwrap_or_else(|| {
+            let topic = Topic::new(topic.to_string());
+            state.topics.insert(path.clone(), topic);
+            topic
+        }).subscribers;*/
         //println!("{:#?}", state.topics);
-        for client_name in clients_to_send {
+        for (client_name, qos) in clients_to_send {
             let (_, tx) = state.clients.get_mut(client_name).unwrap();
-            // send stuff using client's tx/framed
             println!("sending packet to {} on topic {} with message: {:#?}", client_name, topic, message);
             tx.send(Publish(mqtt_codec::Publish {
                 dup: false,
                 retain: false,
-                qos:mqtt_codec::QoS::AtMostOnce,
+                qos: *qos,
                 packet_id,
                 topic: topic.clone(),
                 payload: message.clone()
             })).await;
-            println!("sent packet to {}",client_name);
+            println!("sent publish packet to {}",client_name);
+
+            match qos {
+                // if packet_id is None, the Codec failed and we are in a world of hurt
+                QoS::AtLeastOnce => {
+                    tx.send(PublishAck{
+                        packet_id: packet_id.unwrap()
+                    }).await;
+                },
+                QoS::ExactlyOnce => {
+                    // TODO: add to map of awaiting publishes
+                    tx.send(PublishReceived{
+                        packet_id: packet_id.unwrap()
+                    }).await;
+                },
+                QoS::AtMostOnce => {
+                    // don't need to do anything
+                }
+            };
         }
     }
 
