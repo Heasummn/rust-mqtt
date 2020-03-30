@@ -10,7 +10,7 @@ edition = "2018"
 mqtt-codec = "0.3.0"
 tokio-util = {version = "0.2.0", features = ["codec"]}
 futures = "0.3.4"
-sequence_trie = "*"
+sequence_trie = "0.3.6"
 bytes = "0.5.2"
 bytestring = "0.1.4"
 
