@@ -8,10 +8,8 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use tokio::net::TcpListener;
 
-use mqtt_codec::{Packet, Packet::*, QoS, SubscribeReturnCode};
+use mqttrs::*;
 
-use bytes::Bytes;
-use bytestring::ByteString;
 use sequence_trie::SequenceTrie;
 
 use crate::client::Client;
@@ -39,7 +37,7 @@ struct BrokerState {
     clients: HashMap<String, (Client, Sender<Packet>)>,
     topics: SequenceTrie<String, Topic>,
     // TODO: Turn this into set + random numbers
-    cur_id: u16,
+    pid: Pid,
 }
 
 impl Topic {
@@ -56,7 +54,7 @@ impl BrokerState {
         BrokerState {
             clients: HashMap::new(),
             topics: SequenceTrie::new(),
-            cur_id: 0,
+            pid: Pid::new(),
         }
     }
 }
@@ -118,7 +116,7 @@ impl Broker {
                     let (client, tx) = state.clients.get_mut(&id).unwrap();
                     //println!("{:#?}", packet);
                     match packet {
-                        Disconnect => {
+                        Packet::Disconnect => {
                             for topic_str in &client.topics {
                                 let topic = topic_str.split('/');
                                 state.topics.remove(topic);
@@ -126,12 +124,11 @@ impl Broker {
                             state.clients.remove(&id);
                             println!("{:#?}", state.clients);
                         }
-                        Subscribe {
-                            packet_id,
-                            topic_filters,
-                        } => {
-                            let mut qos_response: Vec<SubscribeReturnCode> = Vec::new();
-                            for (topic, qos) in topic_filters {
+                        Packet::Subscribe(Subscribe {pid, topics}) => {
+                            let mut qos_response: Vec<SubscribeReturnCodes> = Vec::new();
+                            for topic in topics {
+                                let qos = topic.qos;
+                                let topic = topic.topic_path;
                                 let path_str: &str = topic.as_ref();
                                 let path = path_str.split('/');
                                 println!("{:?}", path.clone().collect::<Vec<_>>());
@@ -180,35 +177,34 @@ impl Broker {
                                     };
                                     //println!("{:#?}", state.topics.get_prefix_nodes(path.clone()));
                                 }
-                                qos_response.push(SubscribeReturnCode::Success(qos));
+                                qos_response.push(SubscribeReturnCodes::Success(qos));
                             }
-                            tx.send(SubscribeAck {
-                                packet_id,
-                                status: qos_response,
-                            })
+                            tx.send(Packet::Suback(Suback {
+                                pid,
+                                return_codes: qos_response,
+                            }))
                             .await;
                         }
-                        Publish(pub_packet) => {
+                        Packet::Publish(pub_packet) => {
                             // TODO: handle dups/wildcards
                             Broker::send_publish(
                                 &mut state,
                                 pub_packet.payload,
-                                pub_packet.topic,
-                                pub_packet.packet_id,
-                                pub_packet.qos,
+                                pub_packet.topic_name,
+                                pub_packet.qospid,
                             )
                             .await;
                         }
-                        PublishAck { .. } => {
+                        Packet::Puback(_) => {
                             // TODO: remove from map
                         }
-                        PublishReceived { packet_id } => {
-                            tx.send(PublishRelease { packet_id }).await;
+                        Packet::Pubrec(packet_id) => {
+                            tx.send(Packet::Pubrel(packet_id)).await;
                         }
-                        PublishRelease { packet_id } => {
-                            tx.send(PublishReceived { packet_id }).await;
+                        Packet::Pubrel(packet_id) => {
+                            tx.send(Packet::Pubrec(packet_id)).await;
                         }
-                        PublishComplete { .. } => {
+                        Packet::Pubcomp(_) => {
                             // TODO: remove from map
                         }
                         _ => {}
@@ -244,20 +240,19 @@ impl Broker {
 
     async fn send_publish(
         state: &mut BrokerState,
-        message: Bytes,
-        topic: ByteString,
-        packet_id: Option<u16>,
-        packet_qos: QoS,
+        message: Vec<u8>,
+        topic: String,
+        packet_qos: QosPid,
     ) {
-        let path_str: &str = topic.as_ref();
-        let path = path_str.split('/');
+        let cloned_topic = topic.clone();
+        let path = cloned_topic.split('/');
         //println!("{:#?}", path);
         let clients_to_send = &match state.topics.get(path.clone()) {
             Some(val) => val,
             None => {
-                let topic = Topic::new(topic.to_string());
+                let topic = Topic::new(topic.clone().to_string());
                 state.topics.insert(path.clone(), topic);
-                &state.topics.get(path.clone()).unwrap()
+                &state.topics.get(path).unwrap()
             }
         }
         .subscribers;
@@ -269,40 +264,36 @@ impl Broker {
                 "sending packet to {} on topic {} with message: {:#?}",
                 client_name, topic, message
             );
-            let cli_packet_id = match qos {
-                QoS::AtLeastOnce | QoS::ExactlyOnce => {
-                    state.cur_id += 1;
-                    Some(state.cur_id)
+            let qospid = match qos {
+                QoS::AtLeastOnce => {
+                    state.pid = state.pid + 1;
+                    QosPid::AtLeastOnce(state.pid)
                 }
-                QoS::AtMostOnce => None,
+                QoS::ExactlyOnce => {
+                    state.pid = state.pid + 1;
+                    QosPid::ExactlyOnce(state.pid)
+                }
+                QoS::AtMostOnce => QosPid::AtMostOnce,
             };
-            tx.send(Publish(mqtt_codec::Publish {
+            tx.send(Packet::Publish(Publish {
                 dup: false,
                 retain: false,
-                qos: *qos,
-                packet_id: cli_packet_id,
-                topic: topic.clone(),
+                qospid: qospid,
+                topic_name: topic.clone(),
                 payload: message.clone(),
             }))
             .await;
             println!("sent publish packet to {}", client_name);
 
             match packet_qos {
-                // if packet_id is None, the Codec failed and we are in a world of hurt
-                QoS::AtLeastOnce => {
-                    tx.send(PublishAck {
-                        packet_id: packet_id.unwrap(),
-                    })
-                    .await;
+                QosPid::AtLeastOnce(pid) => {
+                    tx.send(Packet::Puback(pid)).await;
                 }
-                QoS::ExactlyOnce => {
+                QosPid::ExactlyOnce(pid) => {
                     // TODO: add to map of awaiting publishes
-                    tx.send(PublishReceived {
-                        packet_id: packet_id.unwrap(),
-                    })
-                    .await;
+                    tx.send(Packet::Pubrec(pid)).await;
                 }
-                QoS::AtMostOnce => {
+                QosPid::AtMostOnce => {
                     // don't need to do anything
                 }
             };

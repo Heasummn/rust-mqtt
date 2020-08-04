@@ -1,5 +1,7 @@
 use crate::broker::BrokerMessage;
 use crate::broker::BrokerMessage::*;
+use crate::codec::MQTTCodec;
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -7,8 +9,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::codec::Framed;
 
 use futures::{SinkExt, StreamExt};
-
-use mqtt_codec::{Codec, ConnectCode::*, Packet, Packet::*};
+use mqttrs::{Packet, Connack, ConnectReturnCode};
 
 #[derive(Debug)]
 pub struct Client {
@@ -29,15 +30,15 @@ impl Client {
     }
 
     async fn handle_messages(
-        framed: &mut Framed<TcpStream, Codec>,
+        framed: &mut Framed<TcpStream, MQTTCodec>,
         tx_broker: &mut Sender<BrokerMessage>,
         client_key: String,
         packet: Packet,
     ) {
         match packet {
-            PingRequest => {
+            Packet::Pingreq => {
                 println!("Ping");
-                framed.send(PingResponse).await;
+                framed.send(Packet::Pingresp).await;
             }
             _ => {
                 tx_broker
@@ -55,16 +56,16 @@ impl Client {
         addr: SocketAddr,
         tx_broker: &mut Sender<BrokerMessage>,
     ) {
-        let mut framed = Framed::new(stream, Codec::new());
+        let mut framed = Framed::new(stream, MQTTCodec::new());
 
         // do connection handshake
         let packet = match framed.next().await {
-            Some(Ok(Connect(packet))) => {
+            Some(Ok(Packet::Connect(packet))) => {
                 framed
-                    .send(ConnectAck {
+                    .send(Packet::Connack( Connack{
                         session_present: false,
-                        return_code: ConnectionAccepted,
-                    })
+                        code: ConnectReturnCode::Accepted,
+                    }))
                     .await;
                 packet
             }
@@ -85,7 +86,7 @@ impl Client {
             tokio::select! {
                 Some(Ok(packet)) = framed.next() => {
                     match packet {
-                        Disconnect => {
+                        Packet::Disconnect => {
                             Client::handle_messages(&mut framed, tx_broker, client_key.clone(), packet).await;
                             break;
                         },

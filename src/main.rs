@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 mod broker;
 mod client;
+mod codec;
 
 use broker::Broker;
 
